@@ -2525,7 +2525,11 @@ static int signal_name_owner_changed(sd_bus_message *message, void *userdata, sd
 
 int unit_install_bus_match(sd_bus *bus, Unit *u, const char *name) {
         _cleanup_free_ char *match = NULL;
+        const char *owner;
+        _cleanup_bus_message_unref_ sd_bus_message *reply = NULL;
+        _cleanup_bus_error_free_ sd_bus_error error = SD_BUS_ERROR_NULL;
         Manager *m = u->manager;
+        int r;
 
         assert(m);
 
@@ -2544,7 +2548,45 @@ int unit_install_bus_match(sd_bus *bus, Unit *u, const char *name) {
         if (!match)
                 return -ENOMEM;
 
-        return sd_bus_add_match(bus, &u->match_bus_slot, match, signal_name_owner_changed, u);
+        r = sd_bus_add_match(bus, &u->match_bus_slot, match, signal_name_owner_changed, u);
+        if (r < 0)
+                return log_warning_errno(r, "Failed to subscribe to NameOwnerChanged signal: %m");
+
+        log_info("Subscribed to NameOwnerChanged for '%s'", name);
+
+        /* Check if there is already an owner. */
+        r = sd_bus_call_method(
+                        bus,
+                        "org.freedesktop.DBus",
+                        "/org/freedesktop/DBus",
+                        "org.freedesktop.DBus",
+                        "GetNameOwner",
+                        &error,
+                        &reply,
+                        "s",
+                        name);
+
+        if (r < 0) {
+                /* If there is no owner yet, just wait. */
+                if (sd_bus_error_has_name(&error, SD_BUS_ERROR_NAME_HAS_NO_OWNER)) {
+                        log_info("Bus name '%s' has no owner yet.", name);
+                        return 0;
+                }
+
+                return log_warning_errno(r, "Failed to call GetNameOwner: %m");
+        }
+
+        /* There is an owner, so fire the signal. */
+        r = sd_bus_message_read(reply, "s", &owner);
+        if (r < 0)
+                return r;
+
+        log_info("Found bus owner for '%s': %s", name, owner);
+
+        if (UNIT_VTABLE(u)->bus_name_owner_change)
+                UNIT_VTABLE(u)->bus_name_owner_change(u, name, NULL, owner);
+
+        return 0;
 }
 
 int unit_watch_bus_name(Unit *u, const char *name) {
